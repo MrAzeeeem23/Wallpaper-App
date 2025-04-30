@@ -157,7 +157,7 @@ const styles = StyleSheet.create({
     color: "white",
   },
   wallpapersList: {
-    padding: 8,
+    padding: 0,
     paddingBottom: 20,
   },
   wallpaperItem: {

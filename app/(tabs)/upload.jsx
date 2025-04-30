@@ -12,6 +12,7 @@ import {
   KeyboardAvoidingView,
   Platform,
   Alert,
+  ActivityIndicator,
 } from "react-native"
 import { useWallpapers } from "../../provider/WallpaperProvider"
 import { useTheme } from "../../provider/ThemeProvider"
@@ -20,13 +21,13 @@ import Animated, { FadeIn } from "react-native-reanimated"
 import * as ImagePicker from "expo-image-picker"
 
 export default function UploadScreen() {
-  const { uploadWallpaper } = useWallpapers()
+  const { uploadWallpaper, isLoading } = useWallpapers()
   const { colors } = useTheme()
-  const [selectedImage, setSelectedImage] = useState<string | null>(null)
+  const [selectedImage, setSelectedImage] = useState(null)
   const [title, setTitle] = useState("")
   const [category, setCategory] = useState("")
   const [description, setDescription] = useState("")
-  const [isUploading, setIsUploading] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState(0)
 
   const pickImage = async () => {
     try {
@@ -67,27 +68,40 @@ export default function UploadScreen() {
     }
 
     try {
-      setIsUploading(true)
-      await uploadWallpaper()
+      // Define progress callback function
+      const onProgress = (progress) => {
+        setUploadProgress(progress.progress)
+      }
+      
+      // Call upload function from provider
+      await uploadWallpaper(
+        selectedImage,
+        title.trim(),
+        category.trim(),
+        description.trim(),
+        onProgress
+      )
 
-      // Reset form
+      // Reset form after successful upload
       setSelectedImage(null)
       setTitle("")
       setCategory("")
       setDescription("")
+      setUploadProgress(0)
 
       Alert.alert("Success", "Wallpaper uploaded successfully!")
     } catch (error) {
       console.error("Error uploading:", error)
       Alert.alert("Error", "Failed to upload wallpaper. Please try again.")
-    } finally {
-      setIsUploading(false)
     }
   }
 
   const clearImage = () => {
     setSelectedImage(null)
   }
+
+  // Calculate upload progress percentage for display
+  const progressPercentage = Math.round(uploadProgress * 100)
 
   return (
     <KeyboardAvoidingView
@@ -162,14 +176,27 @@ export default function UploadScreen() {
               numberOfLines={4}
             />
 
-            <TouchableOpacity
-              style={[styles.uploadButton, { backgroundColor: colors.primary }]}
-              onPress={handleUpload}
-              disabled={isUploading || !selectedImage}
-            >
-              <Upload size={20} color="white" />
-              <Text style={styles.uploadButtonText}>{isUploading ? "Uploading..." : "Upload Wallpaper"}</Text>
-            </TouchableOpacity>
+            {isLoading ? (
+              <View style={[styles.uploadButton, { backgroundColor: colors.primary }]}>
+                <ActivityIndicator color="white" size="small" style={{ marginRight: 10 }} />
+                <Text style={styles.uploadButtonText}>Uploading... {progressPercentage}%</Text>
+              </View>
+            ) : (
+              <TouchableOpacity
+                style={[
+                  styles.uploadButton, 
+                  { 
+                    backgroundColor: selectedImage ? colors.primary : colors.disabled,
+                    opacity: selectedImage ? 1 : 0.7
+                  }
+                ]}
+                onPress={handleUpload}
+                disabled={!selectedImage || !title.trim()}
+              >
+                <Upload size={20} color="white" />
+                <Text style={styles.uploadButtonText}>Upload Wallpaper</Text>
+              </TouchableOpacity>
+            )}
           </View>
         </Animated.View>
       </ScrollView>
@@ -276,4 +303,7 @@ const styles = StyleSheet.create({
     fontFamily: "Poppins-SemiBold",
     marginLeft: 8,
   },
+  disabled: {
+    opacity: 0.7,
+  }
 })

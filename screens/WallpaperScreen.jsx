@@ -1,25 +1,79 @@
 "use client"
 
 import { useState } from "react"
-import { View, Text, StyleSheet, Image, TouchableOpacity, Alert, Platform, ActivityIndicator } from "react-native"
-import { useRoute } from "@react-navigation/native"
+import {
+  View,
+  Text,
+  StyleSheet,
+  Image,
+  TouchableOpacity,
+  ScrollView,
+  Alert,
+  ActivityIndicator,
+  Platform,
+  Share,
+  Linking,
+} from "react-native"
+import { useLocalSearchParams, useRouter } from "expo-router"
+import { useWallpapers } from "../provider/WallpaperProvider"
+import { StatusBar } from "expo-status-bar"
+import { BlurView } from "expo-blur"
+import { ArrowLeft, Heart, Download, Share2, Image as ImageIcon } from "lucide-react-native"
 import * as FileSystem from "expo-file-system"
 import * as MediaLibrary from "expo-media-library"
-// import * as Wallpaper from "expo-wallpaper"
-import { Download, Image as ImageIcon } from "lucide-react-native"
+import * as IntentLauncher from "expo-intent-launcher"
+import * as Sharing from "expo-sharing"
+import * as ImagePicker from "expo-image-picker"
+import Animated, { FadeIn } from "react-native-reanimated"
 
 export default function WallpaperDetailScreen() {
-  const route = useRoute()
-  const { wallpaper } = route.params
+  const { id } = useLocalSearchParams()
+  const { wallpapers, favorites, toggleFavorite, addDownload } = useWallpapers()
   const [loading, setLoading] = useState(false)
+  const router = useRouter()
+
+  const wallpaper = wallpapers.find((w) => w.id === id)
+  const isFavorite = favorites.includes(wallpaper?.id)
+
+  if (!wallpaper) {
+    return (
+      <View style={styles.notFoundContainer}>
+        <Text style={styles.notFoundText}>Wallpaper not found</Text>
+        <TouchableOpacity style={styles.backButton} onPress={() => router.back()}>
+          <Text style={styles.backButtonText}>Go Back</Text>
+        </TouchableOpacity>
+      </View>
+    )
+  }
 
   const requestPermissions = async () => {
-    const { status } = await MediaLibrary.requestPermissionsAsync()
-    if (status !== "granted") {
-      Alert.alert("Permission Required", "Please grant media library permissions to save wallpapers.", [{ text: "OK" }])
-      return false
+    // Request media library permissions
+    const { status: mediaStatus } = await MediaLibrary.requestPermissionsAsync();
+    
+    if (mediaStatus !== "granted") {
+      Alert.alert(
+        "Permission Required", 
+        "Please grant media library permissions to save wallpapers.", 
+        [{ text: "OK" }]
+      );
+      return false;
     }
-    return true
+    
+    // On Android 10+ we need to request write permissions separately
+    if (Platform.OS === 'android' && parseInt(Platform.Version, 10) >= 29) {
+      try {
+        const { status: writeStatus } = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync();
+        if (writeStatus !== 'granted') {
+          console.log('Storage permission not granted');
+          // Continue anyway, we'll try to use MediaLibrary
+        }
+      } catch (error) {
+        console.log('Error requesting storage permissions:', error);
+        // Continue anyway, we'll try to use MediaLibrary
+      }
+    }
+    
+    return true;
   }
 
   const downloadWallpaper = async () => {
@@ -31,19 +85,47 @@ export default function WallpaperDetailScreen() {
         return
       }
 
-      const fileUri = FileSystem.documentDirectory + wallpaper.title.replace(/\s+/g, "_") + ".jpg"
+      // Validate URL
+      if (!wallpaper.imageUrl.startsWith('http://') && !wallpaper.imageUrl.startsWith('https://')) {
+        throw new Error('Invalid image URL. URL must start with http:// or https://');
+      }
+      
+      // Download image to app's cache directory
+      const fileUri = FileSystem.cacheDirectory + wallpaper.title.replace(/\s+/g, "_") + ".jpg"
+      
+      console.log("Downloading from:", wallpaper.imageUrl)
+      console.log("Saving to:", fileUri)
+      
       const downloadResult = await FileSystem.downloadAsync(wallpaper.imageUrl, fileUri)
+      console.log("Download result:", downloadResult)
 
       if (downloadResult.status === 200) {
-        const asset = await MediaLibrary.createAssetAsync(downloadResult.uri)
-        await MediaLibrary.createAlbumAsync("Wallpapers", asset, false)
-        Alert.alert("Success", "Wallpaper saved to your gallery!")
+        try {
+          // Save to media library
+          const asset = await MediaLibrary.saveToLibraryAsync(fileUri)
+          console.log("Saved to library:", asset)
+          
+          // Try to create album
+          try {
+            const assetInfo = await MediaLibrary.getAssetInfoAsync(asset)
+            await MediaLibrary.createAlbumAsync("Wallpapers", assetInfo, false)
+          } catch (albumError) {
+            console.log("Error creating album (non-critical):", albumError)
+            // Continue even if album creation fails
+          }
+          
+          addDownload(wallpaper.id)
+          Alert.alert("Success", "Wallpaper saved to your gallery!")
+        } catch (mediaError) {
+          console.error("MediaLibrary error:", mediaError)
+          Alert.alert("Permission Error", "Could not save to gallery. Please check your permissions.")
+        }
       } else {
         Alert.alert("Error", "Failed to download wallpaper.")
       }
     } catch (error) {
       console.error("Error downloading wallpaper:", error)
-      Alert.alert("Error", "Failed to download wallpaper.")
+      Alert.alert("Error", `Failed to download wallpaper: ${error.message}`)
     } finally {
       setLoading(false)
     }
@@ -63,17 +145,42 @@ export default function WallpaperDetailScreen() {
       const downloadResult = await FileSystem.downloadAsync(wallpaper.imageUrl, fileUri)
 
       if (downloadResult.status === 200) {
+        const asset = await MediaLibrary.createAssetAsync(downloadResult.uri)
+        addDownload(wallpaper.id)
+        
         if (Platform.OS === "android") {
-          // On Android, we can set the wallpaper directly
-          await Wallpaper.setWallpaperAsync(downloadResult.uri)
-          Alert.alert("Success", "Wallpaper applied successfully!")
+          // On Android, use Intent to open the wallpaper picker
+          try {
+            // MediaLibrary.getContentUriAsync is not available, use the asset URI directly
+  const contentUri = asset.uri
+            await IntentLauncher.startActivityAsync("android.intent.action.ATTACH_DATA", {
+              data: contentUri,
+              type: "image/jpeg",
+              flags: 1, // FLAG_GRANT_READ_URI_PERMISSION
+            })
+          } catch (intentError) {
+            console.error("Intent error:", intentError)
+            // Fallback method: Share the image
+            await Sharing.shareAsync(downloadResult.uri, {
+              dialogTitle: "Set As Wallpaper",
+              mimeType: "image/jpeg",
+              UTI: "public.jpeg",
+            })
+            Alert.alert(
+              "Set as Wallpaper",
+              "Please use your device's built-in options to set this image as wallpaper.",
+              [{ text: "OK" }]
+            )
+          }
         } else {
-          // On iOS, we need to save it to the gallery and guide the user
-          const asset = await MediaLibrary.createAssetAsync(downloadResult.uri)
+          // On iOS, save to gallery and guide the user
           Alert.alert(
             "Wallpaper Saved",
-            "The wallpaper has been saved to your gallery. Please go to Settings > Wallpaper to set it as your wallpaper.",
-            [{ text: "OK" }],
+            "The wallpaper has been saved to your Photos app. To set as wallpaper:\n\n1. Open the Photos app\n2. Find this image\n3. Tap the share icon\n4. Select 'Use as Wallpaper'",
+            [
+              { text: "Open Photos", onPress: () => Linking.openURL("photos-redirect://") },
+              { text: "OK" }
+            ]
           )
         }
       } else {
@@ -87,39 +194,76 @@ export default function WallpaperDetailScreen() {
     }
   }
 
+  const shareWallpaper = async () => {
+    try {
+      await Share.share({
+        message: `Check out this amazing wallpaper: ${wallpaper.title}`,
+        url: wallpaper.imageUrl,
+      })
+    } catch (error) {
+      console.error("Error sharing wallpaper:", error)
+    }
+  }
+
   return (
     <View style={styles.container}>
-      <Image source={{ uri: wallpaper.imageUrl }} style={styles.wallpaperImage} resizeMode="cover" />
+      <StatusBar style="light" />
+      <Image source={{ uri: wallpaper.imageUrl }} style={styles.wallpaperImage} />
 
-      <View style={styles.infoContainer}>
-        <Text style={styles.title}>{wallpaper.title}</Text>
-        <Text style={styles.category}>{wallpaper.category}</Text>
-        <Text style={styles.description}>{wallpaper.description}</Text>
-      </View>
+      <TouchableOpacity style={styles.backButton} onPress={() => router.back()}>
+        <ArrowLeft size={24} color="white" />
+      </TouchableOpacity>
 
-      <View style={styles.actionsContainer}>
-        <TouchableOpacity style={styles.actionButton} onPress={downloadWallpaper} disabled={loading}>
-          {loading ? (
-            <ActivityIndicator size="small" color="white" />
-          ) : (
-            <>
-              <Download size={20} color="white" />
-              <Text style={styles.actionButtonText}>Download</Text>
-            </>
-          )}
-        </TouchableOpacity>
+      <TouchableOpacity
+        style={[styles.favoriteButton, isFavorite && styles.favoriteButtonActive]}
+        onPress={() => toggleFavorite(wallpaper.id)}
+      >
+        <Heart size={24} color="white" fill={isFavorite ? "#ef4444" : "transparent"} />
+      </TouchableOpacity>
 
-        <TouchableOpacity style={[styles.actionButton, styles.applyButton]} onPress={setAsWallpaper} disabled={loading}>
-          {loading ? (
-            <ActivityIndicator size="small" color="white" />
-          ) : (
-            <>
-              <ImageIcon size={20} color="white" />
-              <Text style={styles.actionButtonText}>Set as Wallpaper</Text>
-            </>
-          )}
-        </TouchableOpacity>
-      </View>
+      <Animated.View entering={FadeIn.duration(800)} style={styles.bottomSheet}>
+        <BlurView intensity={20} tint="dark" style={styles.blurContainer}>
+          <ScrollView style={styles.detailsContainer}>
+            <Text style={styles.title}>{wallpaper.title}</Text>
+            <Text style={styles.category}>{wallpaper.category}</Text>
+            <Text style={styles.description}>{wallpaper.description}</Text>
+            <Text style={styles.downloads}>{wallpaper.downloads} downloads</Text>
+
+            <View style={styles.actionsContainer}>
+              <TouchableOpacity style={styles.actionButton} onPress={downloadWallpaper} disabled={loading}>
+                {loading ? (
+                  <ActivityIndicator size="small" color="white" />
+                ) : (
+                  <>
+                    <Download size={20} color="white" />
+                    <Text style={styles.actionButtonText}>Download</Text>
+                  </>
+                )}
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.actionButton, styles.applyButton]}
+                onPress={setAsWallpaper}
+                disabled={loading}
+              >
+                {loading ? (
+                  <ActivityIndicator size="small" color="white" />
+                ) : (
+                  <>
+                    <ImageIcon size={20} color="white" />
+                    <Text style={styles.actionButtonText}>Set as Wallpaper</Text>
+                  </>
+                )}
+              </TouchableOpacity>
+
+              <TouchableOpacity style={[styles.actionButton, styles.shareButton]} onPress={shareWallpaper}>
+                <Share2 size={20} color="white" />
+                <Text style={styles.actionButtonText}>Share</Text>
+              </TouchableOpacity>
+            </View>
+          </ScrollView>
+        </BlurView>
+      </Animated.View>
     </View>
   )
 }
@@ -127,48 +271,91 @@ export default function WallpaperDetailScreen() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: "#f9fafb",
+    backgroundColor: "black",
   },
   wallpaperImage: {
     width: "100%",
-    height: "70%",
+    height: "100%",
+    position: "absolute",
   },
-  infoContainer: {
-    padding: 16,
+  backButton: {
+    position: "absolute",
+    top: 50,
+    left: 16,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: "rgba(0, 0, 0, 0.3)",
+    justifyContent: "center",
+    alignItems: "center",
+    zIndex: 10,
   },
-  title: {
-    fontSize: 20,
-    fontWeight: "bold",
-    color: "#1f2937",
+  favoriteButton: {
+    position: "absolute",
+    top: 50,
+    right: 16,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: "rgba(0, 0, 0, 0.3)",
+    justifyContent: "center",
+    alignItems: "center",
+    zIndex: 10,
   },
-  category: {
-    fontSize: 14,
-    color: "#6b7280",
-    marginTop: 4,
+  favoriteButtonActive: {
+    backgroundColor: "rgba(239, 68, 68, 0.3)",
   },
-  description: {
-    fontSize: 14,
-    color: "#4b5563",
-    marginTop: 8,
-    lineHeight: 20,
-  },
-  actionsContainer: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    padding: 16,
+  bottomSheet: {
     position: "absolute",
     bottom: 0,
     left: 0,
     right: 0,
-    backgroundColor: "white",
-    borderTopWidth: 1,
-    borderTopColor: "#e5e7eb",
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    overflow: "hidden",
+  },
+  blurContainer: {
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+  },
+  detailsContainer: {
+    padding: 24,
+    maxHeight: 400,
+  },
+  title: {
+    fontSize: 24,
+    fontFamily: "Poppins-Bold",
+    color: "white",
+  },
+  category: {
+    fontSize: 16,
+    fontFamily: "Poppins-Medium",
+    color: "rgba(255, 255, 255, 0.8)",
+    marginTop: 4,
+  },
+  description: {
+    fontSize: 14,
+    fontFamily: "Poppins-Regular",
+    color: "rgba(255, 255, 255, 0.7)",
+    marginTop: 12,
+    lineHeight: 22,
+  },
+  downloads: {
+    fontSize: 14,
+    fontFamily: "Poppins-Medium",
+    color: "rgba(255, 255, 255, 0.6)",
+    marginTop: 12,
+  },
+  actionsContainer: {
+    marginTop: 24,
+    flexDirection: "row",
+    justifyContent: "space-between",
   },
   actionButton: {
     flex: 1,
     backgroundColor: "#0ea5e9",
     padding: 12,
-    borderRadius: 8,
+    borderRadius: 12,
     flexDirection: "row",
     justifyContent: "center",
     alignItems: "center",
@@ -176,12 +363,222 @@ const styles = StyleSheet.create({
   },
   applyButton: {
     backgroundColor: "#10b981",
+    marginRight: 8,
+  },
+  shareButton: {
+    backgroundColor: "#8b5cf6",
     marginRight: 0,
-    marginLeft: 8,
   },
   actionButtonText: {
     color: "white",
-    fontWeight: "bold",
+    fontFamily: "Poppins-Medium",
     marginLeft: 8,
   },
+  notFoundContainer: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 20,
+    backgroundColor: "#f9fafb",
+  },
+  notFoundText: {
+    fontSize: 18,
+    fontFamily: "Poppins-Medium",
+    color: "#1e293b",
+    marginBottom: 16,
+  },
+  backButtonText: {
+    fontSize: 16,
+    fontFamily: "Poppins-Medium",
+    color: "#0ea5e9",
+  },
 })
+
+
+// "use client"
+
+// import { useState } from "react"
+// import { View, Text, StyleSheet, Image, TouchableOpacity, Alert, Platform, ActivityIndicator } from "react-native"
+// import { useRoute } from "@react-navigation/native"
+// import * as FileSystem from "expo-file-system"
+// import * as MediaLibrary from "expo-media-library"
+// // import * as Wallpaper from "expo-wallpaper"
+// import { Download, Image as ImageIcon } from "lucide-react-native"
+
+// export default function WallpaperDetailScreen() {
+//   const route = useRoute()
+//   const { wallpaper } = route.params
+//   const [loading, setLoading] = useState(false)
+
+//   const requestPermissions = async () => {
+//     const { status } = await MediaLibrary.requestPermissionsAsync()
+//     if (status !== "granted") {
+//       Alert.alert("Permission Required", "Please grant media library permissions to save wallpapers.", [{ text: "OK" }])
+//       return false
+//     }
+//     return true
+//   }
+
+//   const downloadWallpaper = async () => {
+//     try {
+//       setLoading(true)
+//       const hasPermission = await requestPermissions()
+//       if (!hasPermission) {
+//         setLoading(false)
+//         return
+//       }
+
+//       const fileUri = FileSystem.documentDirectory + wallpaper.title.replace(/\s+/g, "_") + ".jpg"
+//       const downloadResult = await FileSystem.downloadAsync(wallpaper.imageUrl, fileUri)
+
+//       if (downloadResult.status === 200) {
+//         const asset = await MediaLibrary.createAssetAsync(downloadResult.uri)
+//         await MediaLibrary.createAlbumAsync("Wallpapers", asset, false)
+//         Alert.alert("Success", "Wallpaper saved to your gallery!")
+//       } else {
+//         Alert.alert("Error", "Failed to download wallpaper.")
+//       }
+//     } catch (error) {
+//       console.error("Error downloading wallpaper:", error)
+//       Alert.alert("Error", "Failed to download wallpaper.")
+//     } finally {
+//       setLoading(false)
+//     }
+//   }
+
+//   const setAsWallpaper = async () => {
+//     try {
+//       setLoading(true)
+//       const hasPermission = await requestPermissions()
+//       if (!hasPermission) {
+//         setLoading(false)
+//         return
+//       }
+
+//       // First download the image
+//       const fileUri = FileSystem.documentDirectory + wallpaper.title.replace(/\s+/g, "_") + ".jpg"
+//       const downloadResult = await FileSystem.downloadAsync(wallpaper.imageUrl, fileUri)
+
+//       if (downloadResult.status === 200) {
+//         if (Platform.OS === "android") {
+//           // On Android, we can set the wallpaper directly
+//           await Wallpaper.setWallpaperAsync(downloadResult.uri)
+//           Alert.alert("Success", "Wallpaper applied successfully!")
+//         } else {
+//           // On iOS, we need to save it to the gallery and guide the user
+//           const asset = await MediaLibrary.createAssetAsync(downloadResult.uri)
+//           Alert.alert(
+//             "Wallpaper Saved",
+//             "The wallpaper has been saved to your gallery. Please go to Settings > Wallpaper to set it as your wallpaper.",
+//             [{ text: "OK" }],
+//           )
+//         }
+//       } else {
+//         Alert.alert("Error", "Failed to download wallpaper.")
+//       }
+//     } catch (error) {
+//       console.error("Error setting wallpaper:", error)
+//       Alert.alert("Error", "Failed to set wallpaper.")
+//     } finally {
+//       setLoading(false)
+//     }
+//   }
+
+//   return (
+//     <View style={styles.container}>
+//       <Image source={{ uri: wallpaper.imageUrl }} style={styles.wallpaperImage} resizeMode="cover" />
+
+//       <View style={styles.infoContainer}>
+//         <Text style={styles.title}>{wallpaper.title}</Text>
+//         <Text style={styles.category}>{wallpaper.category}</Text>
+//         <Text style={styles.description}>{wallpaper.description}</Text>
+//       </View>
+
+//       <View style={styles.actionsContainer}>
+//         <TouchableOpacity style={styles.actionButton} onPress={downloadWallpaper} disabled={loading}>
+//           {loading ? (
+//             <ActivityIndicator size="small" color="white" />
+//           ) : (
+//             <>
+//               <Download size={20} color="white" />
+//               <Text style={styles.actionButtonText}>Download</Text>
+//             </>
+//           )}
+//         </TouchableOpacity>
+
+//         <TouchableOpacity style={[styles.actionButton, styles.applyButton]} onPress={setAsWallpaper} disabled={loading}>
+//           {loading ? (
+//             <ActivityIndicator size="small" color="white" />
+//           ) : (
+//             <>
+//               <ImageIcon size={20} color="white" />
+//               <Text style={styles.actionButtonText}>Set as Wallpaper</Text>
+//             </>
+//           )}
+//         </TouchableOpacity>
+//       </View>
+//     </View>
+//   )
+// }
+
+// const styles = StyleSheet.create({
+//   container: {
+//     flex: 1,
+//     backgroundColor: "#f9fafb",
+//   },
+//   wallpaperImage: {
+//     width: "100%",
+//     height: "70%",
+//   },
+//   infoContainer: {
+//     padding: 16,
+//   },
+//   title: {
+//     fontSize: 20,
+//     fontWeight: "bold",
+//     color: "#1f2937",
+//   },
+//   category: {
+//     fontSize: 14,
+//     color: "#6b7280",
+//     marginTop: 4,
+//   },
+//   description: {
+//     fontSize: 14,
+//     color: "#4b5563",
+//     marginTop: 8,
+//     lineHeight: 20,
+//   },
+//   actionsContainer: {
+//     flexDirection: "row",
+//     justifyContent: "space-between",
+//     padding: 16,
+//     position: "absolute",
+//     bottom: 0,
+//     left: 0,
+//     right: 0,
+//     backgroundColor: "white",
+//     borderTopWidth: 1,
+//     borderTopColor: "#e5e7eb",
+//   },
+//   actionButton: {
+//     flex: 1,
+//     backgroundColor: "#0ea5e9",
+//     padding: 12,
+//     borderRadius: 8,
+//     flexDirection: "row",
+//     justifyContent: "center",
+//     alignItems: "center",
+//     marginRight: 8,
+//   },
+//   applyButton: {
+//     backgroundColor: "#10b981",
+//     marginRight: 0,
+//     marginLeft: 8,
+//   },
+//   actionButtonText: {
+//     color: "white",
+//     fontWeight: "bold",
+//     marginLeft: 8,
+//   },
+// })

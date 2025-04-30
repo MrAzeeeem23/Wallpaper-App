@@ -173,6 +173,7 @@ const styles = StyleSheet.create({
   },
   searchInput: {
     flex: 1,
+    marginTop: 8,
     height: 48,
     fontFamily: "Poppins-Regular",
     fontSize: 16,
